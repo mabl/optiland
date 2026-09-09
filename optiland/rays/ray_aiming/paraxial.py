@@ -109,12 +109,9 @@ class ParaxialRayAimer(BaseRayAimer):
                     "ray tracing remains available."
                 )
             if isinstance(self.optic.aperture, ObjectNAAperture):
-                # NA = n*sin(theta), using the object medium at the primary
-                # wavelength, as in ObjectNAAperture.compute_epd.
-                index = self.optic.object_surface.material_post.n(
-                    self.optic.primary_wavelength
-                )
-                sine = self.optic.aperture.value / index
+                # Share the aperture's NA = n*sin(theta) conversion, reference
+                # wavelength and validation with its EPD calculation.
+                sine = self.optic.aperture.object_space_sine(self.optic)
                 # Work directly with directions to avoid a target at 1/sine.
                 # Normalization retains the existing slope-based pupil sampling.
                 L = Px * vx * sine

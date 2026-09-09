@@ -1,7 +1,8 @@
 """Focused object-space telecentric NA regressions for issue #797."""
 
 import math
-from typing import TYPE_CHECKING
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, Literal
 from unittest.mock import Mock
 
 import numpy as np
@@ -15,6 +16,16 @@ from tests.utils import assert_allclose
 
 if TYPE_CHECKING:
     from optiland._types import ScalarOrArray
+
+
+@pytest.fixture
+def restore_backend_precision(set_test_backend: None) -> Iterator[None]:
+    """Restore precision before the backend fixture resets the active backend."""
+    precision = "float32" if be.get_precision() == 32 else "float64"
+    try:
+        yield
+    finally:
+        be.set_precision(precision)
 
 
 def _plane_optic(
@@ -213,6 +224,253 @@ def test_float_by_stop_retains_legacy_telecentric_slope(
     assert_allclose(L**2 + M**2 + N**2, 1.0)
     assert_allclose(L[2], 0.6)
     assert_allclose(N[2], 0.8)
+
+
+INVALID_APERTURE_DATA = {
+    "negative-na": (-0.1, "(?i)NA"),
+    "nan-na": (np.nan, "(?i)NA"),
+    "infinite-na": (np.inf, "(?i)NA"),
+    "grazing-na": (1.5, "(?i)NA"),
+    "supercritical-na": (1.6, "(?i)NA"),
+    "empty-na": ([], "(?i)(one|single) value"),
+    "multiple-na": ([0.6, 0.9], "(?i)(one|single) value"),
+}
+INVALID_OBJECT_INDEX = {
+    "zero-index": (0.0, "(?i)index"),
+    "negative-index": (-1.5, "(?i)index"),
+    "nan-index": (np.nan, "(?i)index"),
+    "infinite-index": (np.inf, "(?i)index"),
+    "empty-index": ([], "(?i)(one|single) value"),
+    "multiple-index": ([1.5, 1.6], "(?i)(one|single) value"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(INVALID_APERTURE_DATA))
+def test_invalid_object_na_is_rejected_by_every_conversion(
+    set_test_backend: None, case: str
+) -> None:
+    """Out-of-domain NA raises instead of reaching a sqrt, arcsin, or division."""
+    value, match = INVALID_APERTURE_DATA[case]
+    optic = _plane_optic(IdealMaterial(1.5))
+    optic.set_aperture("objectNA", be.array(value))
+
+    with pytest.raises(ValueError, match=match):
+        optic.aperture.object_space_sine(optic)
+    with pytest.raises(ValueError, match=match):
+        optic.aperture.compute_epd(optic.paraxial)
+    with pytest.raises(ValueError, match=match):
+        ParaxialRayAimer(optic).aim_rays((0.0, 0.0), 0.55, (0.0, 1.0))
+
+
+@pytest.mark.parametrize("case", sorted(INVALID_OBJECT_INDEX))
+def test_invalid_object_index_is_rejected_by_every_conversion(
+    set_test_backend: None, case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unusable object medium is a configuration error, not a NaN launch."""
+    value, match = INVALID_OBJECT_INDEX[case]
+    optic = _plane_optic(IdealMaterial(1.5))
+    monkeypatch.setattr(
+        optic.object_surface.material_post,
+        "n",
+        Mock(return_value=be.array(value)),
+    )
+
+    with pytest.raises(ValueError, match=match):
+        optic.aperture.object_space_sine(optic)
+    with pytest.raises(ValueError, match=match):
+        optic.aperture.compute_epd(optic.paraxial)
+    with pytest.raises(ValueError, match=match):
+        ParaxialRayAimer(optic).aim_rays((0.0, 0.0), 0.55, (0.0, 1.0))
+
+
+def test_missing_object_is_rejected_by_helper_and_epd(set_test_backend: None) -> None:
+    """Both conversion entry points report the absent object before using geometry."""
+    optic = Optic()
+    optic.set_aperture("objectNA", 0.6)
+
+    with pytest.raises(ValueError, match="defined object surface"):
+        optic.aperture.object_space_sine(optic)
+    with pytest.raises(ValueError, match="defined object surface"):
+        optic.aperture.compute_epd(optic.paraxial)
+
+
+@pytest.mark.parametrize(
+    "na_shape,index_shape",
+    [((1,), ()), ((1, 1), ()), ((), (1, 1)), ((1, 1), (1,))],
+)
+def test_singleton_aperture_shapes_yield_one_scalar_sine(
+    set_test_backend: None,
+    monkeypatch: pytest.MonkeyPatch,
+    na_shape: tuple[int, ...],
+    index_shape: tuple[int, ...],
+) -> None:
+    """A single value of any shape is accepted without adding a ray axis."""
+    material = IdealMaterial(1.5)
+    monkeypatch.setattr(material, "n", Mock(return_value=be.full(index_shape, 1.5)))
+    optic = _plane_optic(material, be.full(na_shape, 0.6))
+    sine = optic.aperture.object_space_sine(optic)
+    assert sine.shape == ()
+    if be.get_backend() == "numpy":
+        assert isinstance(sine, np.ndarray)
+    else:
+        import torch
+
+        assert isinstance(sine, torch.Tensor)
+    assert_allclose(sine, 0.4)
+
+    epd = optic.aperture.compute_epd(optic.paraxial)
+    assert epd.shape == ()
+    assert_allclose(epd, 20.0 * 0.4 / math.sqrt(1 - 0.4**2))
+
+    _, _, _, L, M, N = ParaxialRayAimer(optic).aim_rays(
+        (be.zeros(2), be.zeros(2)),
+        be.full(2, 0.55),
+        (be.zeros(2), be.array([0.5, 1.0])),
+    )
+    for component in (L, M, N):
+        assert component.shape == (2,)
+    assert_allclose(M / N, np.array([0.5, 1.0]) * 0.4 / math.sqrt(1 - 0.4**2))
+
+
+@pytest.mark.parametrize(
+    "typed_operand,na,index",
+    [
+        ("index", 0.6, 1.5),
+        ("index", 1.4999, 1.5),
+        ("index", 1.49999999, 1.5),
+        ("na", 1.5, 1.50000001),
+    ],
+)
+def test_float64_operand_preserves_python_partner_at_float32_precision(
+    restore_backend_precision: None,
+    monkeypatch: pytest.MonkeyPatch,
+    typed_operand: Literal["na", "index"],
+    na: float,
+    index: float,
+) -> None:
+    """Backend precision must not round a valid mixed-precision cone to grazing."""
+    be.set_precision("float64")
+    material = IdealMaterial(index)
+    # Install the parameter before any lookup, rather than replacing cached data.
+    material.index = be.array([index])
+    aperture_value = be.array(na) if typed_operand == "na" else na
+    if typed_operand == "na":
+        monkeypatch.setattr(material, "n", Mock(return_value=index))
+
+    be.set_precision("float32")
+    optic = _plane_optic(material, aperture_value)
+    original_sine = aperture_value / material.n(optic.primary_wavelength)
+    original_epd = 20.0 * be.tan(be.arcsin(original_sine))
+    expected_sine = na / index
+    expected_epd = 20.0 * math.tan(math.asin(expected_sine))
+
+    sine = optic.aperture.object_space_sine(optic)
+    epd = optic.aperture.compute_epd(optic.paraxial)
+    for value in (sine, epd):
+        assert value.shape == ()
+        assert be.to_numpy(value).dtype == np.dtype("float64")
+        assert np.isfinite(be.to_numpy(value)).all()
+    assert_allclose(sine, expected_sine, rtol=1e-12, atol=1e-12)
+    assert_allclose(epd, expected_epd, rtol=1e-10, atol=1e-12)
+    assert_allclose(epd, original_epd, rtol=1e-12, atol=1e-12)
+
+    if be.get_backend() == "torch":
+        import torch
+
+        parameter = material.index if typed_operand == "index" else aperture_value
+        expected_gradient = -na / index**2 if typed_operand == "index" else 1 / index
+        (gradient,) = torch.autograd.grad(sine, parameter)
+        assert_allclose(gradient, expected_gradient, rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize("host_unsigned", [False, True])
+def test_integer_index_preserves_fractional_python_na(
+    set_test_backend: None, monkeypatch: pytest.MonkeyPatch, host_unsigned: bool
+) -> None:
+    """An integer-valued material index must not truncate the fractional NA."""
+    if host_unsigned:
+        index = np.array([2], dtype=np.uint64)
+    elif be.get_backend() == "numpy":
+        index = np.array([2], dtype=np.int64)
+    else:
+        import torch
+
+        index = torch.tensor([2], dtype=torch.int64)
+    material = IdealMaterial(2.0)
+    monkeypatch.setattr(material, "n", Mock(return_value=index))
+    optic = _plane_optic(material, 0.6)
+
+    sine = optic.aperture.object_space_sine(optic)
+    assert np.issubdtype(be.to_numpy(sine).dtype, np.floating)
+    assert_allclose(sine, 0.3, rtol=1e-10, atol=1e-12)
+    assert_allclose(
+        optic.aperture.compute_epd(optic.paraxial),
+        20.0 * math.tan(math.asin(0.3)),
+        rtol=1e-10,
+        atol=1e-12,
+    )
+
+
+def test_reference_wavelength_defaults_to_primary_and_accepts_override(
+    set_test_backend: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both conversions share one reference-wavelength convention."""
+
+    def refractive_index(wavelength: "ScalarOrArray") -> "ScalarOrArray":
+        """Give the primary and requested wavelengths distinct indices."""
+        return 1.5 + 2.0 * (be.array(wavelength) - 0.55)
+
+    optic = _plane_optic(IdealMaterial(1.5))
+    monkeypatch.setattr(
+        optic.object_surface.material_post, "n", Mock(side_effect=refractive_index)
+    )
+
+    assert_allclose(optic.aperture.object_space_sine(optic), 0.6 / 1.5)
+    assert_allclose(optic.aperture.object_space_sine(optic, 0.45), 0.6 / 1.3)
+    # The entrance pupil is 10 mm from the object in this homogeneous system.
+    for wavelength, index in ((None, 1.5), (0.45, 1.3)):
+        sine = 0.6 / index
+        expected = 2 * 10.0 * sine / math.sqrt(1 - sine**2)
+        assert_allclose(
+            optic.aperture.compute_epd(optic.paraxial, wavelength), expected
+        )
+
+
+@pytest.mark.parametrize("na", [0.6, 1.2])
+def test_shared_conversion_keeps_epd_and_launch_consistent(
+    set_test_backend: None, na: float
+) -> None:
+    """The launch angle and the reported entrance pupil describe one cone."""
+    optic = _plane_optic(IdealMaterial(1.5), na)
+    sine = na / 1.5
+    slope = sine / math.sqrt(1 - sine**2)
+
+    assert_allclose(optic.aperture.compute_epd(optic.paraxial), 2 * 10.0 * slope)
+    _, _, _, _, M, N = ParaxialRayAimer(optic).aim_rays((0.0, 0.0), 0.55, (0.0, 1.0))
+    assert_allclose(M / N, slope)
+
+
+@pytest.mark.parametrize("precision", ["float64", "float32"])
+def test_object_space_sine_retains_na_and_index_gradients(
+    restore_backend_precision: None, precision: Literal["float32", "float64"]
+) -> None:
+    """The shared conversion keeps both leaves differentiable: s = NA / n."""
+    if be.get_backend() != "torch":
+        pytest.skip("Autograd requires the torch backend.")
+    import torch
+
+    na = torch.tensor(0.6, dtype=torch.float64, requires_grad=True)
+    index = torch.tensor([1.5], dtype=torch.float64, requires_grad=True)
+    material = IdealMaterial(1.5)
+    material.index = index
+    be.set_precision(precision)
+    optic = _plane_optic(material, na)
+
+    sine = optic.aperture.object_space_sine(optic)
+    assert_allclose(sine, 0.4)
+    grad_na, grad_index = torch.autograd.grad(sine, (na, index))
+    assert_allclose(grad_na, 1 / 1.5)
+    assert_allclose(grad_index, -0.6 / 1.5**2)
 
 
 def test_zero_object_na_launches_finite_axial_rays(set_test_backend: None) -> None:
