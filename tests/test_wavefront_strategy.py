@@ -471,6 +471,13 @@ class TestBestFitSphereStrategy:
 # Waves. Float64 noise on a several-hundred-wave signal sits near 1e-11.
 ZERO_WAVEFRONT_TOLERANCE = 1e-10
 
+# Millimetres. Curving the index-matched stop adds sag without adding refractive
+# power, so the plane wave stays flat while the stop is no longer its own tangent
+# plane. Paraxial aiming targets that tangent plane and iterative aiming targets
+# the real surface, which is what makes the two aimers select different launch
+# coordinates for an oblique field.
+AIMING_DIVERGENT_RADIUS = 20.0
+
 
 def collimated_planes(
     index: float = 1.0,
@@ -541,13 +548,19 @@ def test_plane_wave_is_flat_with_vignetted_pupils(
     assert max_abs_wavefront(optic) < ZERO_WAVEFRONT_TOLERANCE
 
 
+@pytest.mark.parametrize("first_radius", [be.inf, AIMING_DIVERGENT_RADIUS])
 @pytest.mark.parametrize("aiming", ["paraxial", "iterative", "robust"])
 @pytest.mark.parametrize("strategy", ["chief_ray", "centroid", "best_fit"])
 def test_plane_wave_is_flat_for_each_ray_aimer(
-    set_test_backend: None, aiming: str, strategy: str
+    set_test_backend: None, aiming: str, strategy: str, first_radius: float
 ) -> None:
     """Launch phase follows the coordinates selected by the active aimer."""
-    optic = collimated_planes(index=1.5, field=(3.0, 4.0), vignette=(0.4, 0.1))
+    optic = collimated_planes(
+        index=1.5,
+        field=(3.0, 4.0),
+        vignette=(0.4, 0.1),
+        first_radius=first_radius,
+    )
     optic.ray_tracer.set_aiming(aiming, max_iter=20, tol=1e-8)
     assert max_abs_wavefront(optic, strategy=strategy) < ZERO_WAVEFRONT_TOLERANCE
 
@@ -556,7 +569,12 @@ def test_iterative_aiming_changes_the_vignetted_launch_map(
     set_test_backend: None,
 ) -> None:
     """The aiming regression exercises distinct generated launch coordinates."""
-    optic = collimated_planes(index=1.5, field=(3.0, 4.0), vignette=(0.4, 0.1))
+    optic = collimated_planes(
+        index=1.5,
+        field=(3.0, 4.0),
+        vignette=(0.4, 0.1),
+        first_radius=AIMING_DIVERGENT_RADIUS,
+    )
     field = optic.fields.get_field_coords()[-1]
     distribution = create_distribution("hexapolar")
     distribution.generate_points(6)
