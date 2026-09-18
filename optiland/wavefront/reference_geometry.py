@@ -9,6 +9,8 @@ Kramer Harrison, 2026
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from math import isfinite
+from numbers import Real
 from typing import TYPE_CHECKING
 
 import optiland.backend as be
@@ -92,6 +94,8 @@ class PlanarReference(ReferenceGeometry):
     normalized nor tested against an epsilon, so rescaling or reversing it
     leaves the represented plane unchanged. Extremely small accepted normals
     remain subject to ordinary floating-point underflow during later arithmetic.
+    Validation uses each component's own precision, retaining the original real
+    scalars or zero-dimensional arrays for computation and differentiation.
 
     Args:
         point: (x, y, z) point on the plane.
@@ -103,8 +107,10 @@ class PlanarReference(ReferenceGeometry):
     """
 
     def __init__(
-        self, point: tuple[float, float, float], normal: tuple[float, float, float]
-    ):
+        self,
+        point: tuple[float | BEArrayT, float | BEArrayT, float | BEArrayT],
+        normal: tuple[float | BEArrayT, float | BEArrayT, float | BEArrayT],
+    ) -> None:
         vectors = []
         for name, components in (("point", point), ("normal", normal)):
             try:
@@ -120,15 +126,23 @@ class PlanarReference(ReferenceGeometry):
                 )
 
             for component in values:
-                if isinstance(component, str | bytes):
-                    raise ValueError(
-                        f"Plane {name} must contain exactly three finite scalar "
-                        "components."
-                    )
                 try:
-                    scalar = be.asarray(component)
-                    valid = scalar.shape == () and be.all(be.isfinite(scalar))
-                except (TypeError, ValueError, RuntimeError) as exc:
+                    if isinstance(component, Real):
+                        # Backend scalar conversion could narrow a finite Python
+                        # float to the configured working precision.
+                        valid = isfinite(component)
+                    elif isinstance(component, be.ndarray) and component.shape == ():
+                        # Explicit dtype also preserves NumPy scalar arrays when
+                        # checking them with the Torch backend. Store no conversion.
+                        scalar = be.asarray(component, dtype=component.dtype)
+                        # Reject unsupported nonnumeric dtypes before real(),
+                        # which can unwrap a NumPy object scalar to a Python value.
+                        valid = be.all(be.isfinite(scalar)) and (
+                            scalar.dtype == be.real(scalar).dtype
+                        )
+                    else:
+                        valid = False
+                except (TypeError, ValueError, RuntimeError, OverflowError) as exc:
                     raise ValueError(
                         f"Plane {name} must contain exactly three finite scalar "
                         "components."
@@ -154,6 +168,11 @@ class PlanarReference(ReferenceGeometry):
         numerators or denominators also return NaN. The medium index is assumed
         finite; signed geometric intersections are scaled by it.
 
+        Masking protects discarded exact-parallel/nonfinite-input lanes only
+        when evaluated arithmetic and derivatives are representable. Overflow
+        in finite-input lanes, even if subsequently discarded by a caller, can
+        still contaminate shared-medium gradients.
+
         Args:
             rays: Rays whose positions and forward direction cosines define
                 the reverse intersection lines.
@@ -161,7 +180,9 @@ class PlanarReference(ReferenceGeometry):
                 optical path length.
 
         Returns:
-            Signed optical path lengths with the ray array shape and dtype.
+            Signed optical path lengths preserving the ray array shape and
+            following normal backend dtype-promotion rules for the ray, plane,
+            and medium operands.
         """
         L, M, N = -rays.L, -rays.M, -rays.N
         xr, yr, zr = rays.x, rays.y, rays.z
@@ -182,7 +203,8 @@ class PlanarReference(ReferenceGeometry):
         safe_den = be.where(unique, den, 1.0)
         path = n_medium * (-safe_num / safe_den)
 
-        # Insert NaN last to keep invalid lanes out of n_medium's gradient.
+        # Insert NaN last so masked lanes do not poison n_medium's gradient.
+        # This does not protect against overflow in evaluated finite arithmetic.
         return be.where(unique | coplanar, path, be.nan)
 
     @property

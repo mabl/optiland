@@ -10,6 +10,17 @@ from optiland.wavefront.reference_geometry import PlanarReference
 from tests.utils import assert_allclose
 
 
+@pytest.fixture
+def float32_backend(set_test_backend):
+    """Temporarily lower configured precision without narrowing explicit data."""
+    previous_precision = be.get_precision()
+    be.set_precision("float32")
+    try:
+        yield
+    finally:
+        be.set_precision(f"float{previous_precision}")
+
+
 def make_rays(x, y, z, L, M, N):
     """Build the subset of the ray interface used by PlanarReference."""
     return SimpleNamespace(
@@ -25,14 +36,15 @@ def make_rays(x, y, z, L, M, N):
 def axial_rays(z, normal_direction):
     """Build rays whose plane denominator depends only on N."""
     z = be.array(z)
+    normal_direction = be.array(normal_direction)
     zeros = be.zeros_like(z)
     return SimpleNamespace(
         x=zeros,
         y=zeros,
         z=z,
-        L=zeros,
+        L=be.sqrt(1 - normal_direction**2),
         M=zeros,
-        N=be.array(normal_direction),
+        N=normal_direction,
     )
 
 
@@ -76,8 +88,10 @@ def test_exact_parallel_and_nonfinite_contract(set_test_backend):
     reference = PlanarReference((0, 0, 0), (0, 0, 1))
     rays = axial_rays(
         [1, 0, float("nan"), 1, 1],
-        [0, 0, 1, float("inf"), float("nan")],
+        [0, 0, 1, 1, 1],
     )
+    # Inject nonfinite components after constructing otherwise unit directions.
+    rays.N = be.array([0, 0, 1, float("inf"), float("nan")])
 
     with be.errstate(divide="raise", invalid="raise"):
         result = reference.path_length(rays, 1.0)
@@ -151,6 +165,35 @@ def test_invalid_point_or_normal_is_rejected(set_test_backend, point, normal):
         PlanarReference(point, normal)
 
 
+@pytest.mark.parametrize("vector", ["point", "normal"])
+@pytest.mark.parametrize("value", [None, 1.0])
+def test_noniterable_plane_vector_reports_value_error(set_test_backend, vector, value):
+    arguments = {"point": (0.0, 0.0, 0.0), "normal": (0.0, 0.0, 1.0)}
+    arguments[vector] = value
+
+    with pytest.raises(ValueError, match=f"Plane {vector} must contain") as error:
+        PlanarReference(**arguments)
+
+    assert isinstance(error.value.__cause__, TypeError)
+
+
+@pytest.mark.parametrize("vector", ["point", "normal"])
+@pytest.mark.parametrize("dtype", [str, object], ids=["string", "object"])
+def test_nonnumeric_scalar_array_reports_value_error(
+    set_test_backend, vector, dtype
+):
+    # String scalar arrays can arrive from imported tabular data. Backend dtype
+    # or finiteness errors must become the constructor's documented ValueError.
+    component = np.asarray("not a coordinate", dtype=dtype)
+    arguments = {"point": (0.0, 0.0, 0.0), "normal": (0.0, 0.0, 1.0)}
+    arguments[vector] = (0.0, 0.0, component)
+
+    with pytest.raises(ValueError, match=f"Plane {vector} must contain") as error:
+        PlanarReference(**arguments)
+
+    assert isinstance(error.value.__cause__, TypeError)
+
+
 def test_mixed_array_shape_and_dtype_are_preserved(set_test_backend):
     reference = PlanarReference((0, 0, 0), (0, 0, 1))
     rays = axial_rays([[1, -1], [0, 2]], [[1, 1], [0, 0]])
@@ -188,7 +231,7 @@ def test_explicit_float32_dtype_survives_float64_backend_precision(set_test_back
         x=zeros,
         y=zeros,
         z=z,
-        L=zeros,
+        L=be.sqrt(1 - normal_direction**2),
         M=zeros,
         N=normal_direction,
     )
@@ -198,6 +241,110 @@ def test_explicit_float32_dtype_survives_float64_backend_precision(set_test_back
     assert result.dtype == rays.z.dtype
     assert_allclose(result[:3], np.asarray([3, -3, 0], dtype=np.float32), atol=0)
     assert be.isnan(result[3])
+
+
+@pytest.mark.parametrize("component_kind", ["python", "scalar_array"])
+@pytest.mark.parametrize(
+    ("point", "normal"),
+    [
+        ((1e40, 0.0, 0.0), (0.0, 0.0, 1.0)),
+        ((0.0, 0.0, 0.0), (0.0, 0.0, 1e40)),
+        ((0.0, 0.0, 0.0), (0.0, 0.0, 1e-50)),
+    ],
+    ids=["large_point", "large_normal", "tiny_normal"],
+)
+def test_float64_plane_operands_survive_float32_configuration(
+    float32_backend, component_kind, point, normal
+):
+    if component_kind == "scalar_array":
+        point = tuple(be.asarray(value, dtype=be.float64) for value in point)
+        normal = tuple(be.asarray(value, dtype=be.float64) for value in normal)
+    rays = SimpleNamespace(
+        **{
+            name: be.asarray(values, dtype=be.float64)
+            for name, values in {
+                "x": [0.0, 0.0, 0.0],
+                "y": [0.0, 0.0, 0.0],
+                "z": [2.0, -2.0, 0.0],
+                "L": [0.0, 0.0, 0.0],
+                "M": [0.0, 0.0, 0.0],
+                "N": [1.0, 1.0, 1.0],
+            }.items()
+        }
+    )
+
+    reference = PlanarReference(point, normal)
+    result = reference.path_length(rays, 1.5)
+
+    for retained, original in zip(
+        (*reference.point, *reference.normal), (*point, *normal), strict=True
+    ):
+        assert retained is original
+    assert result.dtype == rays.z.dtype
+    assert result.shape == rays.z.shape
+    assert_allclose(result, be.asarray([3.0, -3.0, 0.0], dtype=be.float64), atol=0)
+    assert be.get_precision() == 32
+
+
+@pytest.mark.parametrize("component_kind", ["python", "scalar_array"])
+@pytest.mark.parametrize("vector", ["point", "normal"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_nonfinite_plane_operands_rejected_under_float32_configuration(
+    float32_backend, component_kind, vector, value
+):
+    if component_kind == "scalar_array":
+        value = be.asarray(value, dtype=be.float64)
+    point = (value, 0.0, 0.0) if vector == "point" else (0.0, 0.0, 0.0)
+    normal = (0.0, 0.0, value) if vector == "normal" else (0.0, 0.0, 1.0)
+
+    with pytest.raises(ValueError, match=f"Plane {vector}"):
+        PlanarReference(point, normal)
+
+
+@pytest.mark.parametrize("vector", ["point", "normal"])
+@pytest.mark.parametrize("value", [[1.0], [[1.0]], 1.0 + 2.0j])
+def test_nonscalar_or_complex_array_plane_components_rejected(
+    float32_backend, vector, value
+):
+    dtype = np.complex128 if isinstance(value, complex) else be.float64
+    component = be.asarray(value, dtype=dtype)
+    point = (component, 0.0, 0.0) if vector == "point" else (0.0, 0.0, 0.0)
+    normal = (0.0, 0.0, component) if vector == "normal" else (0.0, 0.0, 1.0)
+
+    with pytest.raises(ValueError, match=f"Plane {vector}"):
+        PlanarReference(point, normal)
+
+
+def test_float64_plane_scalar_tensors_retain_gradients(float32_backend):
+    if be.get_backend() != "torch":
+        pytest.skip("Requires Torch autograd.")
+    point_x = be.asarray(1e40, dtype=be.float64).requires_grad_(True)
+    point_z = be.asarray(0.0, dtype=be.float64).requires_grad_(True)
+    normal_x = be.asarray(0.0, dtype=be.float64).requires_grad_(True)
+    normal_z = be.asarray(1e40, dtype=be.float64).requires_grad_(True)
+    rays = SimpleNamespace(
+        x=be.asarray([0.0], dtype=be.float64),
+        y=be.asarray([0.0], dtype=be.float64),
+        z=be.asarray([2.0], dtype=be.float64),
+        L=be.asarray([0.0], dtype=be.float64),
+        M=be.asarray([0.0], dtype=be.float64),
+        N=be.asarray([1.0], dtype=be.float64),
+    )
+
+    reference = PlanarReference((point_x, 0.0, point_z), (normal_x, 0.0, normal_z))
+    assert reference.point[0] is point_x
+    assert reference.point[2] is point_z
+    assert reference.normal[0] is normal_x
+    assert reference.normal[2] is normal_z
+    result = reference.path_length(rays, 1.5)
+    result.sum().backward()
+
+    assert_allclose(result, 3.0, rtol=1e-12, atol=0)
+    assert_allclose(point_x.grad, 0.0, rtol=0, atol=0)
+    assert_allclose(point_z.grad, -1.5, rtol=1e-12, atol=0)
+    assert_allclose(normal_x.grad, -1.5, rtol=1e-12, atol=0)
+    assert_allclose(normal_z.grad, 0.0, rtol=0, atol=1e-54)
+    assert be.get_precision() == 32
 
 
 def test_torch_gradients_with_invalid_lane_and_differentiable_medium(
@@ -214,7 +361,9 @@ def test_torch_gradients_with_invalid_lane_and_differentiable_medium(
         x=zeros,
         y=zeros,
         z=z,
-        L=zeros,
+        # Keep direction components independent to avoid sqrt's derivative
+        # singularity at N=1 while supplying unit directions at evaluation.
+        L=be.array([0.0, 1.0, 0.0, 1.0]),
         M=zeros,
         N=normal_direction,
     )
