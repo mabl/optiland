@@ -85,26 +85,84 @@ class SphericalReference(ReferenceGeometry):
 
 
 class PlanarReference(ReferenceGeometry):
-    """Planar reference geometry (for afocal systems).
+    """Planar reference geometry for afocal systems.
+
+    The plane is defined by exactly three finite scalar coordinates and a
+    finite, exactly nonzero three-component normal. The normal is neither
+    normalized nor tested against an epsilon, so rescaling or reversing it
+    leaves the represented plane unchanged. Extremely small accepted normals
+    remain subject to ordinary floating-point underflow during later arithmetic.
 
     Args:
         point: (x, y, z) point on the plane.
         normal: (nx, ny, nz) normal vector of the plane.
+
+    Raises:
+        ValueError: If either vector does not contain exactly three finite
+            scalar components, or if the normal is exactly zero.
     """
 
     def __init__(
         self, point: tuple[float, float, float], normal: tuple[float, float, float]
     ):
-        self.point = point
-        self.normal = normal
+        vectors = []
+        for name, components in (("point", point), ("normal", normal)):
+            try:
+                values = tuple(components)
+            except TypeError as exc:
+                raise ValueError(
+                    f"Plane {name} must contain exactly three finite scalar components."
+                ) from exc
+
+            if len(values) != 3:
+                raise ValueError(
+                    f"Plane {name} must contain exactly three finite scalar components."
+                )
+
+            for component in values:
+                if isinstance(component, str | bytes):
+                    raise ValueError(
+                        f"Plane {name} must contain exactly three finite scalar "
+                        "components."
+                    )
+                try:
+                    scalar = be.asarray(component)
+                    valid = scalar.shape == () and be.all(be.isfinite(scalar))
+                except (TypeError, ValueError, RuntimeError) as exc:
+                    raise ValueError(
+                        f"Plane {name} must contain exactly three finite scalar "
+                        "components."
+                    ) from exc
+                if not valid:
+                    raise ValueError(
+                        f"Plane {name} must contain exactly three finite scalar "
+                        "components."
+                    )
+
+            vectors.append(values)
+
+        self.point, self.normal = vectors
+        if all(bool(component == 0) for component in self.normal):
+            raise ValueError("Plane normal must be nonzero.")
 
     def path_length(self, rays: RealRaysT, n_medium: float) -> BEArrayT:
-        # Intersection of line P = P0 + t*D with plane (P - PlanePt) . Normal = 0
-        # (P0 + t*D - PlanePt) . Normal = 0
-        # t * (D . Normal) + (P0 - PlanePt) . Normal = 0
-        # t = - ((P0 - PlanePt) . Normal) / (D . Normal)
+        """Return signed optical distance to the plane along reversed rays.
 
-        # We trace backwards from image plane
+        Every finite nonzero ray-plane denominator is used exactly, without
+        normalization or an epsilon band. A finite parallel ray returns zero
+        when its origin is exactly coplanar and NaN otherwise. Nonfinite
+        numerators or denominators also return NaN. The medium index is assumed
+        finite; signed geometric intersections are scaled by it.
+
+        Args:
+            rays: Rays whose positions and forward direction cosines define
+                the reverse intersection lines.
+            n_medium: Refractive index used to convert geometric distance to
+                optical path length.
+
+        Returns:
+            Signed optical path lengths with the ray array shape and dtype.
+        """
         L, M, N = -rays.L, -rays.M, -rays.N
         xr, yr, zr = rays.x, rays.y, rays.z
         px, py, pz = self.point
@@ -113,12 +171,19 @@ class PlanarReference(ReferenceGeometry):
         num = (xr - px) * nx + (yr - py) * ny + (zr - pz) * nz
         den = L * nx + M * ny + N * nz
 
-        # Avoid division by zero
-        den = be.where(be.abs(den) < 1e-12, 1e-12, den)
+        finite = be.isfinite(num) & be.isfinite(den)
+        unique = finite & (den != 0)
+        coplanar = finite & (den == 0) & (num == 0)
 
-        t = -num / den
+        # Both where branches may be evaluated, so make division safe first.
+        # Scalar branches adopt the computed operands' dtype rather than the
+        # backend's configured default precision.
+        safe_num = be.where(unique, num, 0.0)
+        safe_den = be.where(unique, den, 1.0)
+        path = n_medium * (-safe_num / safe_den)
 
-        return n_medium * t
+        # Insert NaN last to keep invalid lanes out of n_medium's gradient.
+        return be.where(unique | coplanar, path, be.nan)
 
     @property
     def radius(self) -> float:
