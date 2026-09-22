@@ -222,6 +222,9 @@ class OPD(Wavefront):
     def generate_opd_map(self, num_points: int = 256) -> OPDData:
         """Generates the OPD map data.
 
+        Interpolate retained OPD in waves. Positive intensity selects samples;
+        its magnitude does not scale the OPD values.
+
         Args:
             num_points (int, optional): The number of points for interpolation
                 along each axis of the grid. Defaults to 256.
@@ -237,12 +240,11 @@ class OPD(Wavefront):
         z = be.to_numpy(data.opd)
         intensity = be.to_numpy(data.intensity)
 
-        # Ignore zero intensity points
+        # Retain positive-intensity samples without scaling their OPD values.
         mask = intensity > 0
         x = x[mask]
         y = y[mask]
         z = z[mask]
-        intensity = intensity[mask]
 
         x_interp, y_interp = np.meshgrid(
             np.linspace(-1, 1, num_points),
@@ -250,7 +252,7 @@ class OPD(Wavefront):
         )
 
         points = np.column_stack((x.flatten(), y.flatten()))
-        values = z.flatten() * intensity.flatten()
+        values = z.flatten()
 
         z_interp = griddata(points, values, (x_interp, y_interp), method="cubic")
 
